@@ -14,11 +14,28 @@ import pickle
 import psutil
 import numpy as np
 import torch
+from torch.utils.tensorboard.writer import SummaryWriter
+from torchvision.utils import make_grid
 import dnnlib
 from torch_utils import distributed as dist
 from torch_utils import training_stats
 from torch_utils import persistence
 from torch_utils import misc
+import sys
+sys.path.append("..")
+import generate_images
+
+def compute_quartile_losses_full(loss_tensor, sigmas, loss_boundaries, loss_prefix='Loss/loss', pmean=None, pstd=None):
+    quartiles = torch.bucketize(sigmas, loss_boundaries)  # shape [N]
+
+    result = {}
+    for q in range(len(loss_boundaries) + 1):
+        mask = (quartiles == q)  # shape = [N]
+        if mask.any():
+            # 直接切出屬於該區的 loss tensor：shape = [Nq, C, H, W]
+            selected_loss = loss_tensor[mask]
+            result[f'{loss_prefix}_q{q}'] = selected_loss  # 保留原 shape
+    return result
 
 #----------------------------------------------------------------------------
 # Uncertainty-based loss function (Equations 14,15,16,21) proposed in the
@@ -38,7 +55,7 @@ class EDM2Loss:
         noise = torch.randn_like(images) * sigma
         denoised, logvar = net(images + noise, sigma, labels, return_logvar=True)
         loss = (weight / logvar.exp()) * ((denoised - images) ** 2) + logvar
-        return loss
+        return loss, sigma.squeeze()
 
 #----------------------------------------------------------------------------
 # Learning rate decay schedule used in the paper "Analyzing and Improving
@@ -127,6 +144,7 @@ def training_loop(
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs)
     optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs)
     ema = dnnlib.util.construct_class_by_name(net=net, **ema_kwargs) if ema_kwargs is not None else None
+    writer = SummaryWriter(os.path.join(run_dir, 'tb'))
 
     # Load previous checkpoint and decide how long to train.
     checkpoint = dist.CheckpointIO(state=state, net=net, loss_fn=loss_fn, optimizer=optimizer, ema=ema)
@@ -147,6 +165,14 @@ def training_loop(
     cumulative_training_time = 0
     start_nimg = state.cur_nimg
     stats_jsonl = None
+
+    # 計算不同時間的 loss
+    loss_low = torch.exp(torch.tensor(loss_kwargs['P_mean'] - 0.674_490 * loss_kwargs['P_std']))
+    loss_mid = torch.exp(torch.tensor(loss_kwargs['P_mean'] + 0.0 * loss_kwargs['P_std']))
+    loss_high = torch.exp(torch.tensor(loss_kwargs['P_mean'] + 0.674_490 * loss_kwargs['P_std']))
+    loss_boundaries = [loss_low.item(), loss_mid.item(), loss_high.item()]
+    loss_boundaries = torch.tensor(loss_boundaries, device=device)
+
     while True:
         done = (state.cur_nimg >= stop_at_nimg)
 
@@ -181,6 +207,8 @@ def training_loop(
                 items = [f'"{name}": ' + (fmt.get(name, '%g') % value if np.isfinite(value) else 'NaN') for name, value in items]
                 stats_jsonl.write('{' + ', '.join(items) + '}\n')
                 stats_jsonl.flush()
+                for name, value in training_stats.default_collector.as_dict().items():
+                    writer.add_scalar(name, value.mean, state.cur_nimg // 1000)
 
             # Update progress and check for abort.
             dist.update_progress(state.cur_nimg // 1000, stop_at_nimg // 1000)
@@ -203,6 +231,19 @@ def training_loop(
                 dist.print0('done')
                 del data # conserve memory
 
+            # generate images
+            with torch.no_grad():
+                image_iter = generate_images.generate_images(net=net, seeds=range(0, 16), encoder=encoder)
+                for r in image_iter:
+                    imgs = torch.nn.functional.interpolate(r.images, scale_factor=2)
+                    imgs = make_grid(imgs, nrow=4,)
+                    writer.add_images(f'images', imgs, state.cur_nimg // 1000, dataformats="CHW")
+                image_iter = generate_images.generate_images(net=net, seeds=range(0, 16), encoder=encoder, num_steps=1)
+                for r in image_iter:
+                    imgs = torch.nn.functional.interpolate(r.images, scale_factor=2)
+                    imgs = make_grid(imgs, nrow=4,)
+                    writer.add_images(f'images-1s', imgs, state.cur_nimg // 1000, dataformats="CHW")
+
         # Save state checkpoint.
         if checkpoint_nimg is not None and (done or state.cur_nimg % checkpoint_nimg == 0) and state.cur_nimg != start_nimg:
             checkpoint.save(os.path.join(run_dir, f'training-state-{state.cur_nimg//1000:07d}.pt'))
@@ -220,8 +261,17 @@ def training_loop(
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
                 images, labels = next(dataset_iterator)
                 images = encoder.encode_latents(images.to(device))
-                loss = loss_fn(net=ddp, images=images, labels=labels.to(device))
+                loss, sigma = loss_fn(net=ddp, images=images, labels=labels.to(device))
                 training_stats.report('Loss/loss', loss)
+                # 報告 quartile losses（不壓縮）
+                loss_qtensors = compute_quartile_losses_full(
+                    loss, sigma,
+                    loss_boundaries,
+                    pmean=loss_kwargs['P_mean'], pstd=loss_kwargs['P_std']
+                )
+                for name, value in loss_qtensors.items():
+                    training_stats.report(name, value.mean())  # value: shape = [?,3,32,32]
+
                 loss.sum().mul(loss_scaling / batch_gpu_total).backward()
 
         # Run optimizer and update weights.

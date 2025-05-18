@@ -4,4 +4,4 @@ sudo docker run --gpus all -it --rm --user $(id -u):$(id -g) \
     python train_edm2.py \
     --outdir=.training-runs/baseline-edm2-img64-xs \
     --data=.datasets/img32.zip \
-    --preset=edm2-img64-xs \
+    --preset=edm2-img64-xs

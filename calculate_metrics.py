@@ -8,9 +8,11 @@
 """Calculate evaluation metrics (FID and FD_DINOv2)."""
 
 import os
+from pathlib import Path
 import click
 import tqdm
 import pickle
+import csv
 import numpy as np
 import scipy.linalg
 import torch
@@ -147,6 +149,7 @@ def calculate_stats_for_iterable(
     verbose     = True,                 # Enable status prints?
     dest_path   = None,                 # Where to save the statistics. None = do not save.
     device      = torch.device('cuda'), # Which compute device to use.
+    **kwargs,                           # Additional arguments for the feature detectors.
 ):
     # Initialize.
     num_batches = len(image_iter)
@@ -325,8 +328,10 @@ def cmdline():
 @click.option('--seed',                     help='Random seed for selecting the images', metavar='INT',     type=int, default=0, show_default=True)
 @click.option('--batch', 'max_batch_size',  help='Maximum batch size', metavar='INT',                       type=click.IntRange(min=1), default=64, show_default=True)
 @click.option('--workers', 'num_workers',   help='Subprocesses to use for data loading', metavar='INT',     type=click.IntRange(min=0), default=2, show_default=True)
+@click.option('--outlog', 'log_file',       help='Output log file name', metavar='PATH',                type=str, default=None, required=True)
 
 def calc(ref_path, metrics, **opts):
+    print(opts)
     """Calculate metrics for a given set of images."""
     torch.multiprocessing.set_start_method('spawn')
     dist.init()
@@ -336,7 +341,18 @@ def calc(ref_path, metrics, **opts):
     for r in tqdm.tqdm(stats_iter, unit='batch', disable=(dist.get_rank() != 0)):
         pass
     if dist.get_rank() == 0:
-        calculate_metrics_from_stats(stats=r.stats, ref=ref, metrics=metrics)
+        metrics = calculate_metrics_from_stats(stats=r.stats, ref=ref, metrics=metrics)
+        if opts["log_file"] is not None:
+            metrics_csv = Path(opts["log_file"])
+            has_header = metrics_csv.exists()
+            with open(metrics_csv, 'a', newline ='') as csvfile:
+                field = ["image_path"] + list(metrics.keys())
+                dictwriter = csv.DictWriter(csvfile, fieldnames = field)
+
+                if not has_header:
+                    dictwriter.writeheader() #寫入標題
+                dictwriter.writerow({'image_path': opts["image_path"], **metrics})
+
     torch.distributed.barrier()
 
 #----------------------------------------------------------------------------

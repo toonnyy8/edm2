@@ -12,6 +12,7 @@ ENV PYTHONUNBUFFERED=1
 
 # Note: huggingface_hub==0.26.5 fails as in https://github.com/easydiffusion/easydiffusion/issues/1851
 RUN pip install huggingface_hub==0.25.2 diffusers==0.26.3 accelerate==0.27.2
+RUN pip install numpy==1.26.4
 
 WORKDIR /workspace
 

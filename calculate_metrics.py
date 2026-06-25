@@ -8,11 +8,10 @@
 """Calculate evaluation metrics (FID and FD_DINOv2)."""
 
 import os
-from pathlib import Path
 import click
 import tqdm
 import pickle
-import csv
+import json
 import numpy as np
 import scipy.linalg
 import torch
@@ -139,6 +138,86 @@ def save_stats(stats, path, verbose=True):
         pickle.dump(stats, f)
 
 #----------------------------------------------------------------------------
+# Calculate pairwise distances and Precision/Recall.
+
+def compute_pairwise_distances(X, Y):
+    """
+    計算兩組特徵矩陣的平方歐幾里得距離。
+    D = ||X||^2 - 2 X Y^T + ||Y||^2
+    """
+    norm_X = torch.sum(X ** 2, dim=1, keepdim=True)
+    norm_Y = torch.sum(Y ** 2, dim=1).unsqueeze(0)
+    dist = norm_X - 2 * torch.mm(X, Y.t()) + norm_Y
+    # 避免因為浮點數誤差出現負值
+    return torch.clamp(dist, min=0.0)
+
+def compute_radii(features, k=3, batch_size=10000):
+    """
+    計算每個特徵點到其第 k 近鄰居的距離（流形半徑）。
+    """
+    N = features.shape[0]
+    radii = torch.zeros(N, dtype=torch.float32, device=features.device)
+    
+    for i in range(0, N, batch_size):
+        end = min(i + batch_size, N)
+        batch = features[i:end]
+        
+        # 取得 batch 內特徵對所有特徵的距離
+        dist = compute_pairwise_distances(batch, features)
+        
+        # 尋找第 k 近的鄰居 (k+1 是因為距離為 0 的是自己本身)
+        # topk largest=False 代表找最小值
+        kth_dist = torch.topk(dist, k=k+1, dim=1, largest=False).values[:, k]
+        radii[i:end] = kth_dist
+        
+    return radii
+
+def calculate_precision_recall(real_features, fake_features, k=3, batch_size=5000):
+    """
+    計算 Precision 與 Recall。
+    real_features: 真實影像的特徵張量 [N1, D]
+    fake_features: 生成影像的特徵張量 [N2, D]
+    """
+    # 1. 計算雙方的流形半徑
+    real_radii = compute_radii(real_features, k=k, batch_size=batch_size)
+    fake_radii = compute_radii(fake_features, k=k, batch_size=batch_size)
+
+    N_real = real_features.shape[0]
+    N_fake = fake_features.shape[0]
+
+    # 記錄是否落入流形
+    precision_hits = torch.zeros(N_fake, dtype=torch.bool, device=fake_features.device)
+    recall_hits = torch.zeros(N_real, dtype=torch.bool, device=real_features.device)
+
+    # 2. 分批比對距離與半徑
+    for i in range(0, N_fake, batch_size):
+        end_i = min(i + batch_size, N_fake)
+        fake_batch = fake_features[i:end_i]
+
+        for j in range(0, N_real, batch_size):
+            end_j = min(j + batch_size, N_real)
+            real_batch = real_features[j:end_j]
+
+            # 計算這兩個 batch 之間的成對距離 [fake_batch_size, real_batch_size]
+            dist = compute_pairwise_distances(fake_batch, real_batch) 
+
+            # Precision: 生成影像是否落在真實影像的半徑內？
+            # dist <= real_radii[j:end_j]
+            in_real_manifold = dist <= real_radii[j:end_j].unsqueeze(0)
+            precision_hits[i:end_i] |= in_real_manifold.any(dim=1)
+
+            # Recall: 真實影像是否落在生成影像的半徑內？
+            # dist <= fake_radii[i:end_i]
+            in_fake_manifold = dist <= fake_radii[i:end_i].unsqueeze(1)
+            recall_hits[j:end_j] |= in_fake_manifold.any(dim=0)
+
+    # 3. 計算最終比例
+    precision = precision_hits.float().mean().item()
+    recall = recall_hits.float().mean().item()
+
+    return {'precision': precision, 'recall': recall}
+
+#----------------------------------------------------------------------------
 # Calculate feature statistics for the given image batches
 # in a distributed fashion. Returns an iterable that yields
 # dnnlib.EasyDict(stats, images, batch_idx, num_batches)
@@ -149,7 +228,7 @@ def calculate_stats_for_iterable(
     verbose     = True,                 # Enable status prints?
     dest_path   = None,                 # Where to save the statistics. None = do not save.
     device      = torch.device('cuda'), # Which compute device to use.
-    **kwargs,                           # Additional arguments for the feature detectors.
+    **kwargs,
 ):
     # Initialize.
     num_batches = len(image_iter)
@@ -173,13 +252,15 @@ def calculate_stats_for_iterable(
             for s in state:
                 s.cum_mu = torch.zeros([s.detector.feature_dim], dtype=torch.float64, device=device)
                 s.cum_sigma = torch.zeros([s.detector.feature_dim, s.detector.feature_dim], dtype=torch.float64, device=device)
+                s.local_features = []
+
             cum_images = torch.zeros([], dtype=torch.int64, device=device)
 
             # Loop over batches.
             for batch_idx, images in enumerate(image_iter):
                 if isinstance(images, dict) and 'images' in images: # dict(images)
                     images = images['images']
-                elif isinstance(images, (tuple, list)) and len(images) == 2: # (images, labels)
+                elif isinstance(images, (tuple, list)) and len(images) >= 2: # (images, indices, labels)
                     images = images[0]
                 images = torch.as_tensor(images).to(device)
 
@@ -189,6 +270,7 @@ def calculate_stats_for_iterable(
                         features = s.detector(images).to(torch.float64)
                         s.cum_mu += features.sum(0)
                         s.cum_sigma += features.T @ features
+                        s.local_features.append(features.cpu().numpy())
                     cum_images += images.shape[0]
 
                 # Output results.
@@ -200,7 +282,15 @@ def calculate_stats_for_iterable(
                     for s in state:
                         mu = all_reduce(s.cum_mu) / r.num_images
                         sigma = (all_reduce(s.cum_sigma) - mu.ger(mu) * r.num_images) / (r.num_images - 1)
-                        r.stats[s.metric] = dict(mu=mu.cpu().numpy(), sigma=sigma.cpu().numpy())
+
+                        local_feats_concat = np.concatenate(s.local_features, axis=0)
+                        gathered_feats = [None for _ in range(dist.get_world_size())]
+                        torch.distributed.all_gather_object(gathered_feats, local_feats_concat)
+                        all_features = np.concatenate(gathered_feats, axis=0)[:r.num_images]
+
+                        r.stats[s.metric] = dict(mu=mu.cpu().numpy(),
+                                                 sigma=sigma.cpu().numpy(),
+                                                 features=all_features)
                     if dest_path is not None and dist.get_rank() == 0:
                         save_stats(stats=r.stats, path=dest_path, verbose=False)
                 yield r
@@ -270,9 +360,27 @@ def calculate_metrics_from_stats(
         m = np.square(stats[metric]['mu'] - ref[metric]['mu']).sum()
         s, _ = scipy.linalg.sqrtm(np.dot(stats[metric]['sigma'], ref[metric]['sigma']), disp=False)
         value = float(np.real(m + np.trace(stats[metric]['sigma'] + ref[metric]['sigma'] - s * 2)))
-        results[metric] = value
+        results[metric] = {"score": value}
         if verbose:
             print(f'{metric} = {value:g}')
+
+        # 2. 順便計算該特徵的 Precision 與 Recall
+        if 'features' in stats[metric] and 'features' in ref[metric]:
+            # 將特徵轉為 PyTorch Tensor 並移至 GPU 進行加速計算
+            real_feats = torch.tensor(ref[metric]['features'], device='cuda', dtype=torch.float32)
+            fake_feats = torch.tensor(stats[metric]['features'], device='cuda', dtype=torch.float32)
+            
+            pr_results = calculate_precision_recall(real_feats, fake_feats)
+            
+            results[metric] |= {"precision": pr_results['precision'], "recall": pr_results['recall']}
+
+            if verbose:
+                print(f'{metric}_precision = {results[metric]["precision"]:g}')
+                print(f'{metric}_recall = {results[metric]["recall"]:g}')
+        else:
+            if verbose:
+                print(f'Missing raw features for {metric}, skipping Precision/Recall.')
+
     return results
 
 #----------------------------------------------------------------------------
@@ -323,15 +431,15 @@ def cmdline():
 @cmdline.command()
 @click.option('--images', 'image_path',     help='Path to the images', metavar='PATH|ZIP',                  type=str, required=True)
 @click.option('--ref', 'ref_path',          help='Dataset reference statistics ', metavar='PKL|NPZ|URL',    type=str, required=True)
+@click.option('--outfile', 'outfile',       help='Path to the output csv file', metavar='PATH',             type=str, required=True)
+@click.option('--name', 'expr_name',        help='experiment name', metavar='STR',                          type=str, required=True)
 @click.option('--metrics',                  help='List of metrics to compute', metavar='LIST',              type=parse_metric_list, default='fid,fd_dinov2', show_default=True)
 @click.option('--num', 'num_images',        help='Number of images to use', metavar='INT',                  type=click.IntRange(min=2), default=50000, show_default=True)
 @click.option('--seed',                     help='Random seed for selecting the images', metavar='INT',     type=int, default=0, show_default=True)
 @click.option('--batch', 'max_batch_size',  help='Maximum batch size', metavar='INT',                       type=click.IntRange(min=1), default=64, show_default=True)
 @click.option('--workers', 'num_workers',   help='Subprocesses to use for data loading', metavar='INT',     type=click.IntRange(min=0), default=2, show_default=True)
-@click.option('--outlog', 'log_file',       help='Output log file name', metavar='PATH',                type=str, default=None, required=True)
 
 def calc(ref_path, metrics, **opts):
-    print(opts)
     """Calculate metrics for a given set of images."""
     torch.multiprocessing.set_start_method('spawn')
     dist.init()
@@ -341,18 +449,13 @@ def calc(ref_path, metrics, **opts):
     for r in tqdm.tqdm(stats_iter, unit='batch', disable=(dist.get_rank() != 0)):
         pass
     if dist.get_rank() == 0:
-        metrics = calculate_metrics_from_stats(stats=r.stats, ref=ref, metrics=metrics)
-        if opts["log_file"] is not None:
-            metrics_csv = Path(opts["log_file"])
-            has_header = metrics_csv.exists()
-            with open(metrics_csv, 'a', newline ='') as csvfile:
-                field = ["image_path"] + list(metrics.keys())
-                dictwriter = csv.DictWriter(csvfile, fieldnames = field)
-
-                if not has_header:
-                    dictwriter.writeheader() #寫入標題
-                dictwriter.writerow({'image_path': opts["image_path"], **metrics})
-
+        results = calculate_metrics_from_stats(stats=r.stats, ref=ref, metrics=metrics)
+        with open(opts['outfile'], 'a') as f:
+            f.write("{",)
+            f.write(f'"name": "{opts['expr_name']}"')
+            for key, val in results.items(): 
+                f.write(f', "{key}": {json.dumps(val)}')
+            f.write("}\n")
     torch.distributed.barrier()
 
 #----------------------------------------------------------------------------

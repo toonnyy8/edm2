@@ -48,13 +48,40 @@ class EDM2Loss:
         self.P_std = P_std
         self.sigma_data = sigma_data
 
+    # def __call__(self, net, images, labels=None):
+    #     rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
+    #     sigma = (rnd_normal * self.P_std + self.P_mean).exp()
+    #     t = 1 - (self.sigma_data / (sigma**2 + self.sigma_data**2).sqrt())  # weight for the variance loss term, based on Equation 21
+    #     tau = torch.rand_like(t) * (1-t) + t
+    #     sigma_tau = ((self.sigma_data / (1-tau)).square() - self.sigma_data ** 2).sqrt()
+    #     # sigma = torch.vmap(torch.where)(torch.rand_like(sigma) < 0.1, sigma_tau, sigma)  # 10% of the time, use sigma_tau as sigma to simulate the boundary case where sigma == sigma_tau
+    #     weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
+    #     noise = torch.randn_like(images)
+    #     z_t = images + noise * sigma
+    #     with torch.no_grad():
+    #         x_t = net(z_t, sigma, sigma, labels, return_logvar=False)
+    #         tgt = sigma_tau/sigma * images - (sigma_tau/sigma - 1) * x_t
+    #         z_tau = tgt + sigma_tau * noise
+    #     denoised, logvar = net(z_tau, sigma_tau, sigma, labels, return_logvar=True)
+    #     loss = (weight / logvar.exp()) * ((denoised - images) ** 2) + logvar
+    #     return loss, sigma.squeeze()
+
     def __call__(self, net, images, labels=None):
         rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()
+        sigma_tau = (sigma * torch.rand_like(sigma)).clamp_min(0.002)
+        sigma_tau = torch.minimum(sigma, sigma_tau)
+        # sigma = torch.vmap(torch.where)(torch.rand_like(sigma) < 0.1, sigma_tau, sigma)  # 10% of the time, use sigma_tau as sigma to simulate the boundary case where sigma == sigma_tau
         weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
-        noise = torch.randn_like(images) * sigma
-        denoised, logvar = net(images + noise, sigma, labels, return_logvar=True)
-        loss = (weight / logvar.exp()) * ((denoised - images) ** 2) + logvar
+        noise = torch.randn_like(images)
+        z_tau = images + noise * sigma_tau
+        with torch.no_grad():
+            x_tau = net(z_tau, sigma_tau, sigma_tau*0., labels, return_logvar=False)
+            tgt = sigma/sigma_tau * images - (sigma/sigma_tau - 1) * x_tau
+            z_t = tgt + sigma * noise
+        denoised, logvar = net(z_t, sigma, sigma_tau*torch.rand_like(sigma), labels, return_logvar=True)
+        # loss = (weight / logvar.exp()) * ((denoised - images) ** 2) + logvar # v11
+        loss = (weight / logvar.exp()) * ((denoised - tgt) ** 2) + logvar # v12
         return loss, sigma.squeeze()
 
 #----------------------------------------------------------------------------
@@ -133,6 +160,7 @@ def training_loop(
     if dist.get_rank() == 0:
         misc.print_module_summary(net, [
             torch.zeros([batch_gpu, net.img_channels, net.img_resolution, net.img_resolution], device=device),
+            torch.ones([batch_gpu], device=device),
             torch.ones([batch_gpu], device=device),
             torch.zeros([batch_gpu, net.label_dim], device=device),
         ], max_nesting=2)

@@ -194,24 +194,30 @@ class UNet(torch.nn.Module):
         model_channels      = 192,          # Base multiplier for the number of channels.
         channel_mult        = [1,2,3,4],    # Per-resolution multipliers for the number of channels.
         channel_mult_noise  = None,         # Multiplier for noise embedding dimensionality. None = select based on channel_mult.
+        channel_mult_noise2 = None,         # Multiplier for second noise embedding dimensionality. None = same as channel_mult_noise.
         channel_mult_emb    = None,         # Multiplier for final embedding dimensionality. None = select based on channel_mult.
         num_blocks          = 3,            # Number of residual blocks per resolution.
         attn_resolutions    = [16,8],       # List of resolutions with self-attention.
         label_balance       = 0.5,          # Balance between noise embedding (0) and class embedding (1).
+        sigma_balance       = 0.5,          # Balance between first sigma embedding (0) and second sigma embedding (1).
         concat_balance      = 0.5,          # Balance between skip connections (0) and main path (1).
         **block_kwargs,                     # Arguments for Block.
     ):
         super().__init__()
         cblock = [model_channels * x for x in channel_mult]
         cnoise = model_channels * channel_mult_noise if channel_mult_noise is not None else cblock[0]
+        cnoise2 = model_channels * channel_mult_noise2 if channel_mult_noise2 is not None else cnoise
         cemb = model_channels * channel_mult_emb if channel_mult_emb is not None else max(cblock)
         self.label_balance = label_balance
+        self.sigma_balance = sigma_balance
         self.concat_balance = concat_balance
         self.out_gain = torch.nn.Parameter(torch.zeros([]))
 
         # Embedding.
         self.emb_fourier = MPFourier(cnoise)
         self.emb_noise = MPConv(cnoise, cemb, kernel=[])
+        self.emb_fourier2 = MPFourier(cnoise2)
+        self.emb_noise2 = MPConv(cnoise2, cemb, kernel=[])
         self.emb_label = MPConv(label_dim, cemb, kernel=[]) if label_dim != 0 else None
 
         # Encoder.
@@ -246,9 +252,12 @@ class UNet(torch.nn.Module):
                 self.dec[f'{res}x{res}_block{idx}'] = Block(cin, cout, cemb, flavor='dec', attention=(res in attn_resolutions), **block_kwargs)
         self.out_conv = MPConv(cout, img_channels, kernel=[3,3])
 
-    def forward(self, x, noise_labels, class_labels):
+    def forward(self, x, noise_labels, class_labels, noise_labels2=None):
         # Embedding.
         emb = self.emb_noise(self.emb_fourier(noise_labels))
+        if noise_labels2 is not None:
+            emb2 = self.emb_noise2(self.emb_fourier2(noise_labels2))
+            emb = mp_sum(emb, emb2, t=self.sigma_balance)
         if self.emb_label is not None:
             emb = mp_sum(emb, self.emb_label(class_labels * np.sqrt(class_labels.shape[1])), t=self.label_balance)
         emb = mp_silu(emb)
@@ -292,24 +301,26 @@ class Precond(torch.nn.Module):
         self.logvar_fourier = MPFourier(logvar_channels)
         self.logvar_linear = MPConv(logvar_channels, 1, kernel=[])
 
-    def forward(self, x, sigma, class_labels=None, force_fp32=False, return_logvar=False, **unet_kwargs):
+    def forward(self, x, sigma, sigma2=None, class_labels=None, force_fp32=False, return_logvar=False, **unet_kwargs):
         x = x.to(torch.float32)
         sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
+        sigma2 = sigma2.to(torch.float32).reshape(-1, 1, 1, 1) if sigma2 is not None else None
         class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32).reshape(-1, self.label_dim)
         dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 
-        # Preconditioning weights.
+        # Preconditioning weights (based on primary sigma).
         c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
         c_out = sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt()
         c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
-        c_noise = sigma.flatten().log() / 4
+        c_noise = (sigma+0.0001).flatten().log() / 4
+        c_noise2 = (sigma2+0.0001).flatten().log() / 4 if sigma2 is not None else None
 
         # Run the model.
         x_in = (c_in * x).to(dtype)
-        F_x = self.unet(x_in, c_noise, class_labels, **unet_kwargs)
+        F_x = self.unet(x_in, c_noise, class_labels, noise_labels2=c_noise2, **unet_kwargs)
         D_x = c_skip * x + c_out * F_x.to(torch.float32)
 
-        # Estimate uncertainty if requested.
+        # Estimate uncertainty if requested (based on primary sigma).
         if return_logvar:
             logvar = self.logvar_linear(self.logvar_fourier(c_noise)).reshape(-1, 1, 1, 1)
             return D_x, logvar # u(sigma) in Equation 21

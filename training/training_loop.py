@@ -21,9 +21,18 @@ from torch_utils import distributed as dist
 from torch_utils import training_stats
 from torch_utils import persistence
 from torch_utils import misc
+from .networks_edm2 import MPConv, normalize
+from typing import TypeVar, TypeGuard, Optional
+from dataclasses import dataclass
 import sys
 sys.path.append("..")
 import generate_images
+
+T = TypeVar("T")
+
+def exists(x: Optional[T]) -> TypeGuard[T]:
+    return x is not None
+
 
 def compute_quartile_losses_full(loss_tensor, sigmas, loss_boundaries, loss_prefix='Loss/loss', pmean=None, pstd=None):
     quartiles = torch.bucketize(sigmas, loss_boundaries)  # shape [N]
@@ -41,6 +50,12 @@ def compute_quartile_losses_full(loss_tensor, sigmas, loss_boundaries, loss_pref
 # Uncertainty-based loss function (Equations 14,15,16,21) proposed in the
 # paper "Analyzing and Improving the Training Dynamics of Diffusion Models".
 
+@dataclass
+class LossItem:
+    name: str
+    loss: torch.Tensor
+    sigma: Optional[torch.Tensor]
+
 @persistence.persistent_class
 class EDM2Loss:
     def __init__(self, P_mean=-0.4, P_std=1.0, sigma_data=0.5):
@@ -55,7 +70,8 @@ class EDM2Loss:
         noise = torch.randn_like(images) * sigma
         denoised, logvar = net(images + noise, sigma, labels, return_logvar=True)
         loss = (weight / logvar.exp()) * ((denoised - images) ** 2) + logvar
-        return loss, sigma.squeeze()
+
+        return (LossItem(name="edm2", loss=loss, sigma=sigma.squeeze()),)
 
 #----------------------------------------------------------------------------
 # Learning rate decay schedule used in the paper "Analyzing and Improving
@@ -68,6 +84,17 @@ def learning_rate_schedule(cur_nimg, batch_size, ref_lr=100e-4, ref_batches=70e3
     if rampup_Mimg > 0:
         lr *= min(cur_nimg / (rampup_Mimg * 1e6), 1)
     return lr
+
+#----------------------------------------------------------------------------
+# Magnitude-preserving convolution or fully-connected layer (Equation 47)
+# with force weight normalization (Equation 66).
+def mpconv_normalize_(module: torch.nn.Module):
+    for model in module.modules():
+        # print(model.__class__.__name__)
+        if isinstance(model, MPConv):
+            with torch.no_grad():
+                w = model.weight.to(torch.float32).nan_to_num(0,0,0)
+                model.weight.copy_(normalize(w)) # forced weight normalization
 
 #----------------------------------------------------------------------------
 # Main training loop.
@@ -257,22 +284,28 @@ def training_loop(
         batch_start_time = time.time()
         misc.set_random_seed(seed, dist.get_rank(), state.cur_nimg)
         optimizer.zero_grad(set_to_none=True)
+        if net.training:
+            mpconv_normalize_(net)
         for round_idx in range(num_accumulation_rounds):
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
                 images, labels = next(dataset_iterator)
                 images = encoder.encode_latents(images.to(device))
-                loss, sigma = loss_fn(net=ddp, images=images, labels=labels.to(device))
-                training_stats.report('Loss/loss', loss)
-                # 報告 quartile losses（不壓縮）
-                loss_qtensors = compute_quartile_losses_full(
-                    loss, sigma,
-                    loss_boundaries,
-                    pmean=loss_kwargs['P_mean'], pstd=loss_kwargs['P_std']
-                )
-                for name, value in loss_qtensors.items():
-                    training_stats.report(name, value.mean())  # value: shape = [?,3,32,32]
+                losses = loss_fn(net=ddp, images=images, labels=labels.to(device))
+                total_loss = torch.zeros([], device=device)
+                for loss_item in losses:
+                    if exists(loss_item.sigma):
+                        loss_qtensors = compute_quartile_losses_full(
+                                loss_item.loss, loss_item.sigma,
+                                loss_boundaries,
+                                loss_prefix=f'Loss/{loss_item.name}',
+                                pmean=loss_kwargs['P_mean'], pstd=loss_kwargs['P_std']
+                            )
+                        for name, value in loss_qtensors.items():
+                            training_stats.report(name, value.mean())  # value: shape = [?,3,32,32]
+                    training_stats.report(f'Loss/{loss_item.name}', loss_item.loss)  # value: shape = [?,3,32,32]
 
-                loss.sum().mul(loss_scaling / batch_gpu_total).backward()
+                    total_loss = total_loss + loss_item.loss.sum().mul(loss_scaling / batch_gpu_total)
+                total_loss.backward()
 
         # Run optimizer and update weights.
         lr = dnnlib.util.call_func_by_name(cur_nimg=state.cur_nimg, batch_size=batch_size, **lr_kwargs)
